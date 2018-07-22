@@ -232,23 +232,26 @@ class DHT(asyncio.DatagramProtocol):
         print(f'收集到{self.count}个infohash', end='\r')
         await self.redis.sadd(REDIS_KEY, infohash)
 
-    def start_server(self):
+    def stop(self):
+        self.running = False
+        self.loop.run_until_complete(asyncio.gather(self.stop_redis(),self.loop.shutdown_asyncgens()))
+        if self.transport:
+            self.transport.close()
+        self.loop.stop()
+        print(f'收集到{self.count}个infohash')
+
+    def start(self):
         listen = self.loop.create_datagram_endpoint(lambda: self, sock=self.sock)
         task_listen = asyncio.ensure_future(listen,loop=self.loop)
         self.loop.run_until_complete(asyncio.gather(task_listen, self.connect_redis()))
         self.transport, _ = task_listen.result()
         asyncio.ensure_future(self.auto_find_node(), loop=self.loop)
-        try:
-            self.loop.run_forever()
-        except KeyboardInterrupt:
-            self.running = False
-            self.loop.run_until_complete(asyncio.gather(self.stop_redis(),self.loop.shutdown_asyncgens()))
-        finally:
-            self.transport.close()
-            self.loop.stop()
-            print(f'收集到{self.count}个infohash')
+        self.loop.run_forever()
 
 
 if __name__ == '__main__':
     dht = DHT(port=8426)
-    dht.start_server()
+    try:
+        dht.start()
+    except KeyboardInterrupt:
+        dht.stop()
