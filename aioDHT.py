@@ -6,9 +6,8 @@ from os import urandom
 from functools import partial
 import socket
 import asyncio
-import codecs
 import aioredis
-import time
+import codecs
 
 
 def random_nid():
@@ -19,12 +18,18 @@ def random_tid():
     return urandom(2)
 
 
-def fake_nid(self_nid, other_nid, sep=2):
-    return other_nid[:-sep] + self_nid[-sep:]
+def fake_nid(self_nid, other_nid, sep=1):
+    nid = other_nid[:-sep] + self_nid[-sep:]
+    if nid == other_nid and sep < 5:
+        return fake_nid(self_nid, other_nid, sep + 1)
+    return nid
 
 
-def encode_infohash(infohash):
-    return codecs.getencoder('hex')(infohash)[0].decode()
+hex_encode = codecs.getencoder('hex')
+
+
+def encode_infohash(hashinfo):
+    return hex_encode(hashinfo)[0].decode()
 
 
 def split_nodes(nodes):
@@ -35,10 +40,8 @@ def split_nodes(nodes):
         nid = nodes[i:i + 20]
         ip = inet_ntoa(nodes[i + 20:i + 24])
         port = unpack('!H', nodes[i + 24:i + 26])[0]
-        yield (nid, ip, port)
+        yield nid, ip, port
 
-
-now = lambda: time.time()
 
 Node = namedtuple('Node', 'nid,ip,port')
 
@@ -48,11 +51,11 @@ TRACKERS = [
     ('router.utorrent.com', 6881),
 ]
 
-REDIS_KEY = 'magnets'
+REDIS_KEY = 'btih'
 
 
 class DHT(asyncio.DatagramProtocol):
-    def __init__(self, port=8520, ip='0.0.0.0', max_node_qsize=1000, limit_get_peers=True, loop=None):
+    def __init__(self, port=8520, ip='0.0.0.0', max_node_qsize=2000, limit_get_peers=True, loop=None):
         self.port = port
         self.ip = ip
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -66,8 +69,6 @@ class DHT(asyncio.DatagramProtocol):
         self.nodes = deque(maxlen=max_node_qsize)
         self.interval = 1 / max_node_qsize
         self.limit = limit_get_peers
-        self.count = 0
-        self.start_time = now()
         self.fake_nid = partial(fake_nid, self.nid)
 
     def bootstrap(self):
@@ -88,14 +89,6 @@ class DHT(asyncio.DatagramProtocol):
         )
         self.send_krpc(msg, address)
 
-    def send_error(self, tid, address, code=202, msg='Server Error'):
-        ret = dict(
-            t=tid,
-            y='e',
-            e=[code, msg]
-        )
-        self.send_krpc(ret, address)
-
     def send_krpc(self, msg, address):
         if not self.transport:
             return
@@ -105,13 +98,13 @@ class DHT(asyncio.DatagramProtocol):
             pass
 
     def on_message(self, msg, address):
-        type = msg.get('y', b'e')
+        msg_type = msg.get('y', b'e')
         if type == b'e':
             return
-        if type == b'r':
+        if msg_type == b'r':
             if 'nodes' in msg['r']:
-                asyncio.ensure_future(self.on_find_node_reply(msg))
-        elif type == b'q':
+                asyncio.ensure_future(self.on_find_node_reply(msg), loop=self.loop)
+        elif msg_type == b'q':
             if msg['q'] == b'get_peers':
                 self.on_get_peers(msg, address)
             elif msg['q'] == b'announce_peer':
@@ -141,22 +134,24 @@ class DHT(asyncio.DatagramProtocol):
         )
         self.send_krpc(res, address)
 
-
     async def on_find_node_reply(self, msg):
-        nodes = split_nodes(msg['r']['nodes'])
-        for node in nodes:
-            nid, ip, port = node
-            if len(nid) != 20 or ip == self.ip or port < 1 or port > 65536:
-                continue
-            n = Node(nid, ip, port)
-            self.nodes.append(n)
-            await asyncio.sleep(self.interval)
+        try:
+            nodes = split_nodes(msg['r']['nodes'])
+            for node in nodes:
+                nid, ip, port = node
+                if len(nid) != 20 or ip == self.ip or port < 1 or port > 65536:
+                    continue
+                n = Node(nid, ip, port)
+                self.nodes.append(n)
+                await asyncio.sleep(self.interval)
+        except KeyboardInterrupt:
+            pass
 
     def on_get_peers(self, msg, address):
-        infohash = msg['a']['info_hash']
-        tid = msg['t']
-        nid = msg['a']['id']
         try:
+            infohash = msg['a']['info_hash']
+            tid = msg['t']
+            nid = msg['a']['id']
             token = infohash[:4]
             res = dict(
                 t=tid,
@@ -168,28 +163,31 @@ class DHT(asyncio.DatagramProtocol):
                 )
             )
             self.send_krpc(res, address)
+            if not self.limit:
+                self.on_get_infohash(infohash)
         except KeyError:
-            self.send_error(tid, address, 203, 'No HashInfo')
-        if not self.limit:
-            self.on_get_infohash(infohash)
+            pass
 
     def on_announce_peer(self, msg, address):
-        tid = msg['t']
-        nid = msg['a']['id']
-        res = dict(
-            t=tid,
-            y='r',
-            r=dict(id=self.fake_nid(nid))
-        )
-        self.send_krpc(res, address)
-        a = msg['a']
-        infohash = a['info_hash']
-        token = a['token']
-        if infohash[:4] == token:
-            self.on_get_infohash(infohash)
+        try:
+            tid = msg['t']
+            nid = msg['a']['id']
+            res = dict(
+                t=tid,
+                y='r',
+                r=dict(id=self.fake_nid(nid))
+            )
+            self.send_krpc(res, address)
+            a = msg['a']
+            infohash = a['info_hash']
+            token = a['token']
+            if infohash[:4] == token:
+                self.on_get_infohash(infohash)
+        except KeyError:
+            pass
 
     def on_get_infohash(self, infohash):
-        asyncio.ensure_future(self.handle(encode_infohash(infohash)), loop=self.loop)
+        asyncio.ensure_future(self.save_magnet(infohash), loop=self.loop)
 
     def connection_made(self, transport):
         self.transport = transport
@@ -202,50 +200,56 @@ class DHT(asyncio.DatagramProtocol):
             pass
 
     async def wait_reply(self):
+        time = 0
         while len(self.nodes) == 0:
             await asyncio.sleep(self.interval)
+            time += self.interval
+            if time > 5:
+                self.bootstrap()
 
-    async def auto_find_node(self):
-        print('running...')
+    async def connect_redis(self):
+        try:
+            self.redis = await aioredis.create_redis_pool('redis://localhost', minsize=10, maxsize=100, loop=self.loop)
+        except ConnectionRefusedError:
+            print('连接Reids失败')
+            self.stop()
+
+    async def stop_redis(self):
+        if self.redis is None:
+            return
+        self.redis.close()
+        await self.redis.wait_closed()
+
+    async def find_node_loop(self):
         self.bootstrap()
         self.running = True
-        await self.wait_reply()
         while self.running:
             try:
                 node = self.nodes.popleft()
                 self.send_find_node((node.ip, node.port), node.nid)
                 await asyncio.sleep(self.interval)
             except IndexError:
-                self.bootstrap()
                 await self.wait_reply()
 
-    async def connect_redis(self):
-        self.redis = await aioredis.create_redis_pool('redis://localhost', minsize=10, maxsize=100, loop=self.loop)
-        print('redis done')
-
-    async def stop_redis(self):
-        self.redis.close()
-        await self.redis.wait_closed()
-
-    async def handle(self, infohash):
-        self.count += 1
-        print(f'收集到{self.count}个infohash', end='\r')
-        await self.redis.sadd(REDIS_KEY, infohash)
+    async def save_magnet(self, infohash):
+        await self.redis.sadd(REDIS_KEY, encode_infohash(infohash))
 
     def stop(self):
         self.running = False
-        self.loop.run_until_complete(asyncio.gather(self.stop_redis(),self.loop.shutdown_asyncgens()))
+        for t in asyncio.Task.all_tasks(loop=self.loop):
+            t.cancel()
+        self.loop.run_until_complete(asyncio.gather(self.stop_redis(), self.loop.shutdown_asyncgens()))
         if self.transport:
             self.transport.close()
         self.loop.stop()
-        print(f'收集到{self.count}个infohash')
 
     def start(self):
         listen = self.loop.create_datagram_endpoint(lambda: self, sock=self.sock)
-        task_listen = asyncio.ensure_future(listen,loop=self.loop)
+        task_listen = asyncio.ensure_future(listen, loop=self.loop)
         self.loop.run_until_complete(asyncio.gather(task_listen, self.connect_redis()))
         self.transport, _ = task_listen.result()
-        asyncio.ensure_future(self.auto_find_node(), loop=self.loop)
+        self.bootstrap()
+        asyncio.ensure_future(self.find_node_loop(), loop=self.loop)
         self.loop.run_forever()
 
 
