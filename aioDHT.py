@@ -31,6 +31,7 @@ hex_encode = codecs.getencoder('hex')
 def encode_infohash(hashinfo):
     return hex_encode(hashinfo)[0].decode()
 
+
 def split_nodes(nodes):
     length = len(nodes)
     if length % 26 != 0:
@@ -189,7 +190,7 @@ class DHT(asyncio.DatagramProtocol):
             pass
 
     def on_get_infohash(self, infohash):
-        asyncio.ensure_future(self.save_magnet(infohash), loop=self.loop)
+        asyncio.ensure_future(self.save_magnet(encode_infohash(infohash)), loop=self.loop)
 
     def connection_made(self, transport):
         self.transport = transport
@@ -234,7 +235,7 @@ class DHT(asyncio.DatagramProtocol):
                 await self.wait_reply()
 
     async def save_magnet(self, infohash):
-        await self.redis.sadd(REDIS_KEY, encode_infohash(infohash))
+        await self.redis.zincrby(REDIS_KEY, 1, infohash)
 
     def stop(self):
         self.running = False
@@ -246,7 +247,7 @@ class DHT(asyncio.DatagramProtocol):
         self.loop.stop()
 
     def start_server(self):
-        listen = self.loop.create_datagram_endpoint(lambda: self,local_addr=(self.ip,self.port))
+        listen = self.loop.create_datagram_endpoint(lambda: self, local_addr=(self.ip, self.port))
         task_listen = asyncio.ensure_future(listen, loop=self.loop)
         self.loop.run_until_complete(asyncio.gather(task_listen, self.connect_redis()))
         self.transport, _ = task_listen.result()
