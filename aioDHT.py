@@ -1,3 +1,6 @@
+# !/usr/bin/env python3
+# encoding=utf-8
+
 from collections import deque, namedtuple
 from bencode import bencode, bdecode, BTFailure
 from socket import inet_ntoa
@@ -18,11 +21,8 @@ def random_tid():
     return urandom(2)
 
 
-def fake_nid(self_nid, other_nid, sep=1):
-    nid = other_nid[:-sep] + self_nid[-sep:]
-    if nid == other_nid and sep < 5:
-        return fake_nid(self_nid, other_nid, sep + 1)
-    return nid
+def fake_nid(self_nid, other_nid, sep=2):
+    return other_nid[:-sep] + self_nid[-sep:]
 
 
 hex_encode = codecs.getencoder('hex')
@@ -30,7 +30,6 @@ hex_encode = codecs.getencoder('hex')
 
 def encode_infohash(hashinfo):
     return hex_encode(hashinfo)[0].decode()
-
 
 def split_nodes(nodes):
     length = len(nodes)
@@ -55,13 +54,11 @@ REDIS_KEY = 'btih'
 
 
 class DHT(asyncio.DatagramProtocol):
-    def __init__(self, port=8520, ip='0.0.0.0', max_node_qsize=2000, limit_get_peers=True, loop=None):
+    def __init__(self, port=1024, ip='0.0.0.0', max_node_qsize=2000, limit_get_peers=True, loop=None):
         self.port = port
         self.ip = ip
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.bind((ip, port))
-        self.sock = sock
         self.nid = random_nid()
+        self.tid = random_tid()
         self.loop = loop or asyncio.get_event_loop()
         self.transport = None
         self.redis = None
@@ -70,6 +67,7 @@ class DHT(asyncio.DatagramProtocol):
         self.interval = 1 / max_node_qsize
         self.limit = limit_get_peers
         self.fake_nid = partial(fake_nid, self.nid)
+        self.ban_fn_reply = False
 
     def bootstrap(self):
         for address in TRACKERS:
@@ -77,7 +75,7 @@ class DHT(asyncio.DatagramProtocol):
 
     def send_find_node(self, address, nid=None):
         nid = self.fake_nid(nid) if nid else self.nid
-        tid = random_tid()
+        tid = self.tid
         msg = dict(
             t=tid,
             y='q',
@@ -135,17 +133,21 @@ class DHT(asyncio.DatagramProtocol):
         self.send_krpc(res, address)
 
     async def on_find_node_reply(self, msg):
-        try:
-            nodes = split_nodes(msg['r']['nodes'])
-            for node in nodes:
-                nid, ip, port = node
-                if len(nid) != 20 or ip == self.ip or port < 1 or port > 65536:
-                    continue
-                n = Node(nid, ip, port)
-                self.nodes.append(n)
-                await asyncio.sleep(self.interval)
-        except KeyboardInterrupt:
-            pass
+        if len(self.nodes) == self.nodes.maxlen:
+            self.ban_fn_reply = True
+            return
+        if len(self.nodes) < self.nodes.maxlen:
+            self.ban_fn_reply = False
+        if self.ban_fn_reply:
+            return
+        nodes = split_nodes(msg['r']['nodes'])
+        for node in nodes:
+            nid, ip, port = node
+            if len(nid) != 20 or ip == self.ip or port < 1 or port > 65536:
+                continue
+            n = Node(nid, ip, port)
+            self.nodes.append(n)
+            await asyncio.sleep(self.interval)
 
     def on_get_peers(self, msg, address):
         try:
@@ -243,8 +245,8 @@ class DHT(asyncio.DatagramProtocol):
             self.transport.close()
         self.loop.stop()
 
-    def start(self):
-        listen = self.loop.create_datagram_endpoint(lambda: self, sock=self.sock)
+    def start_server(self):
+        listen = self.loop.create_datagram_endpoint(lambda: self,local_addr=(self.ip,self.port))
         task_listen = asyncio.ensure_future(listen, loop=self.loop)
         self.loop.run_until_complete(asyncio.gather(task_listen, self.connect_redis()))
         self.transport, _ = task_listen.result()
@@ -252,10 +254,13 @@ class DHT(asyncio.DatagramProtocol):
         asyncio.ensure_future(self.find_node_loop(), loop=self.loop)
         self.loop.run_forever()
 
+    def start(self):
+        try:
+            self.start_server()
+        except KeyboardInterrupt:
+            self.stop()
+
 
 if __name__ == '__main__':
     dht = DHT(port=8426)
-    try:
-        dht.start()
-    except KeyboardInterrupt:
-        dht.stop()
+    dht.start()
